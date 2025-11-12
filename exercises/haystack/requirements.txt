@@ -1,0 +1,3 @@
+# source activate agent
+haystack-ai
+gradio
