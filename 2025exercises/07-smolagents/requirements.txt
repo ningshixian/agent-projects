@@ -1,0 +1,4 @@
+smolagents[toolkit]
+requests
+python-dotenv
+gradio
