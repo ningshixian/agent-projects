@@ -1,0 +1,47 @@
+[
+    {
+        "inputSchema": {
+            "ai_required": ["需要进行参数提取的参数列表"],
+            "type": "object",
+            "properties": {"工具所有参数的描述"},
+        },
+        "scope_description": "当前工具适用范围",
+        "name": "工具名称",
+        "description": "工具描述"
+    },
+    {
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        "scope_description": "0,1101",
+        "name": "考勤-查询年假",
+        "description": "查询年假额度"
+    },
+    {
+        "inputSchema": {
+            "ai_required": [
+                "time_start",
+                "time_end"
+            ],
+            "type": "object",
+            "properties": {
+                "time_start": {
+                    "description": "开始日期 2024-01-01",
+                    "type": "string",
+                    "example": "2024-01-01"
+                },
+                "time_end": {
+                    "description": "结束日期 2024-01-01",
+                    "type": "string",
+                    "example": "2024-01-01"
+                }
+            },
+            "required": []
+        },
+        "scope_description": "0,1101",
+        "name": "考勤-查询年假申请界面天数显示有误原因",
+        "description": "仅负责处理申请年假时，请假页面显示错误、或年假天数时长系统计算有误、或请假时长和实际选择日期不符的情况时调用该工具。只能处理显示有误的情况，若只说明年假额度有误，应调用考勤-查询年假计算规则工具。"
+    }
+]
