@@ -560,8 +560,8 @@ class SwarmSystem:
         system_support_tools = [x for x in tools_list if x['name'] in system_support_map]
         # 跳转工具
         transfer_back_to_triage = {
-            "name": "SystemSupportAgent", 
-            "description": "当用户问题超出当前代理职责范围时调用（包括要求转人工）",
+            "name": "transfer_to_TriageAgent", 
+            "description": "当前任务执行完成，或者需要转接至其他代理继续执行任务，调用此工具",
             "inputSchema": {"type": "object", "properties": {}, "required": []}, 
             "scope_description": "0,1101"
         }
