@@ -414,6 +414,7 @@ class SwarmAgent:
         返回: {'response': str, 'next_agent': str | None, 'messages': List[ChatMessage]}
         """
         messages = self._build_messages(current_user_input, context)
+        initial_msg_count = len(messages)  # 记录初始消息数量
 
         # 安全检查
         if not SafetyGuard.check(current_user_input):
@@ -433,41 +434,34 @@ class SwarmAgent:
 
             logger.info(f"[调试 {self.name}] Output: {agent_msg.text[:50]}... ToolCalls: {len(agent_msg.tool_calls)}")
 
-            # 2. 槽位提取 (无论是否有工具调用，都尝试提取信息)
+            # 2. 统一提取并更新槽位信息 (无论后续是否调用工具)
+            # {"slot_update": {"key": "value", ...}}
             json_str, clean_target = self._extract_slots(agent_msg.text)
+
+            if json_str:
+                try:
+                    json_str = json_str.replace("'", '"')   # 容错：LLM 有时会错误使用单引号
+                    data = json.loads(json_str)
+                    # 更新全局槽位
+                    if new_slots := data.get("slot_update"):
+                        print(f"  [Thought] 捕获槽位: {new_slots}")
+                        context.update_slots(new_slots)
+                    
+                    # 清洗文本 (把 JSON 块从回复中移除，保持对话干净)
+                    # 注意：我们要修改 messages 列表中刚刚 append 进去的那条消息
+                    clean_text = agent_msg.text.replace(clean_target, "").strip()
+                    messages[-1].text = clean_text  # Haystack 2.x ChatMessage 使用 content 或 text 属性
+                    agent_msg = messages[-1]           # 更新引用
+                    
+                except Exception as e:
+                    print(f"  [Error] Slot update failed: {e}")
 
             # 3. 处理工具调用
             if not agent_msg.tool_calls:
                 logger.info("  →Case A: 直接回复 (无工具调用)-> 此时执行正则提取")
-                
-                if json_str:
-                    try:
-                        # 解析 JSON
-                        data = json.loads(json_str)
-                        # 更新全局槽位
-                        if new_slots := data.get("slot_update"):
-                            print(f"  [Thought] 捕获槽位: {new_slots}")
-                            context.update_slots(new_slots)
-                        # 清洗文本 (只替换找到的那部分 JSON/代码块)
-                        clean_text = agent_msg.text.replace(clean_target, "").strip()
-                        messages[-1] =  ChatMessage.from_assistant(clean_text)
-
-                    except json.JSONDecodeError:
-                        # 容错尝试：LLM 有时会错误使用单引号，尝试修复
-                        try:
-                            data = json.loads(json_str.replace("'", '"'))
-                            if new_slots := data.get("slot_update"):
-                                context.update_slots(new_slots)
-                                clean_text = agent_msg.text.replace(clean_target, "").strip()
-                                messages[-1] =  ChatMessage.from_assistant(clean_text)
-                        except:
-                            print(f"  [JSON Error] 解析失败，内容: {json_str[:50]}...")
-                            traceback.print_exc()
-                    except Exception as e:
-                        print(f"  [Error] {e}")
-
                 # Case A: 纯文本回复 (无工具调用)
-                return {"response": agent_msg.text, "next_agent": None, "messages":messages[1:]}
+                new_messages = messages[initial_msg_count:] 
+                return {"response": agent_msg.text, "next_agent": None, "messages":new_messages}
 
             # Case B: 工具调用 (ReAct)
             tool_results = []
@@ -478,10 +472,11 @@ class SwarmAgent:
                 if tc.tool_name.startswith("transfer_to_"):
                     logger.info("  →Case B: 转接工具拦截")
                     next_agent_candidate = tc.tool_name.replace("transfer_to_", "")
+                    new_messages = messages[initial_msg_count:] 
                     return {
                         "response": f"正在为您转接至 {next_agent_candidate}...", 
                         "next_agent": next_agent_candidate, 
-                        "messages": messages[1:]    # 返回包含转接指令的历史
+                        "messages": new_messages    # 返回包含转接指令的历史
                     }
                 
                 # 执行业务工具
@@ -510,7 +505,8 @@ class SwarmAgent:
                 if step == self.max_reflection_steps:
                     return {"response": "系统暂时无法处理该请求，请稍后重试或联系人工。", "next_agent": None, "messages":[]}
 
-        return {"response": messages[-1].text, "next_agent": None, "messages": messages[1:]}
+        new_messages = messages[initial_msg_count:] 
+        return {"response": messages[-1].text, "next_agent": None, "messages": new_messages}
 
 
 # --- 5. 编排系统 (Orchestrator System) ---
@@ -636,7 +632,14 @@ class SwarmSystem:
         )
     
     def run_turn(self, user_input: str, context: GlobalContext) -> str:
-        """运行一轮对话"""
+        """运行一轮对话
+        1、确定当前agent
+        2、执行agent.run()方法 → ReAct 循环（思考->工具->思考）
+        3、更新历史
+        4、切换next_agent指针，返回结果
+            if Back to Triage: 清理/继承状态
+            ...
+        """
         current_agent_name = context.next_agent
         agent = self.agents.get(current_agent_name, self.agents[AgentName.TRIAGE])
         
@@ -648,9 +651,9 @@ class SwarmSystem:
         result = agent.run(user_input, context)
         
         # 更新历史
-        # 注意：这里只追加新产生的 User 和 Assistant 消息，避免重复 System Prompt
-        # 实际逻辑需要精细控制 context.chat_history 的去重
+        # 1. 先把当前轮的用户输入加进去
         context.chat_history.append(ChatMessage.from_user(user_input))
+        # 2. 再追加 Agent 产生的新消息 (Answer, ToolResult 等)
         context.chat_history.extend(result['messages'])  # messages
 
         # 处理Agent转接（处理 Handoff）
