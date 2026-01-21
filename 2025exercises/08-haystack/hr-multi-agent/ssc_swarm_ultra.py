@@ -19,6 +19,7 @@ from dataclasses import replace  # <--- 必须导入这个
 from jinja2 import Template
 from pydantic import BaseModel, Field, create_model, field_validator
 from dotenv import load_dotenv
+from utils import safe_parse_json, get_current_time_str
 
 # Haystack 核心组件
 from haystack import Document, Pipeline
@@ -171,6 +172,7 @@ class UserProfile(BaseModel):
             return float(v.replace("年", ""))
         return v
 
+
 class GlobalContext(BaseModel):
     """全局状态对象，存储跨Agent的结构化数据"""
     user_profile: UserProfile = Field(default_factory=UserProfile)
@@ -207,13 +209,13 @@ class AgentName(str, Enum):
     SUPPORT = "SystemSupportAgent"
 
 # 单独定义描述字典
-AGENT_DESCRIPTIONS = {
-    # AgentName.TRIAGE: "主控代理，负责用户意图识别与分流",
-    AgentName.LEAVE: "转接给 LeaveAgent，处理员工各类假期申请的工作，包括但不限于年假、病假、事假、丧假等",
-    AgentName.STATUS: "转接给 StatusQueryAgent，处理员工考勤状态查询的工作，包括但不限于考勤记录、假期余额、排班信息等",
-    AgentName.MANAGE: "转接给 LeaveManageAgent，处理各类假期管理的工作，包括但不限于撤销申请、提前结束假期等",
-    AgentName.POLICY: "转接给 PolicyQueryAgent，处理考勤与假期政策查询的工作，包括但不限于各类假期的计算规则、资格条件等",
-    AgentName.SUPPORT: "转接给 SystemSupportAgent，处理系统技术支持代理工作，包括但不限于申请提交报错、年假申请界面天数显示有误、页面异常等"
+AGENT_TASK_DESC = {
+    AgentName.TRIAGE: "用户意图识别与任务分发",
+    AgentName.LEAVE: "处理员工各类假期申请的工作，包括但不限于年假、病假、事假、丧假等",
+    AgentName.STATUS: "处理员工考勤状态查询的工作，包括但不限于考勤记录、假期余额、排班信息等",
+    AgentName.MANAGE: "处理各类假期管理的工作，包括但不限于撤销申请、提前结束假期等",
+    AgentName.POLICY: "处理考勤与假期政策查询的工作，包括但不限于各类假期的计算规则、资格条件等",
+    AgentName.SUPPORT: "处理系统技术支持代理工作，包括但不限于申请提交报错、年假申请界面天数显示有误、页面异常等",
 }
 
 
@@ -292,8 +294,8 @@ class ToolFactory:
                 data = resp.json()
                 return data.get("data", {}).get("data", "工具执行成功但无返回数据")
             except Exception as e:
-                logger.error(f"Tool execution failed: {e}")
-                traceback.print_exc()
+                logger.error(f"{traceback.format_exc()}")
+                logger.error(f"{tool_name} with params {payload} 工具执行失败 or 参数错误！")
                 return f"工具执行出错，请重新检查: {str(e)}"
 
         return Tool(
@@ -324,6 +326,11 @@ class ToolFactory:
         # 【考勤-页面访问记录】这个工具的 schema 不太对
         tools_list = [tool for tool in tools_list if tool["name"] != "考勤-页面访问记录"]   # 27
 
+        # schema类型转换，确保兼容性
+        for tool in tools_list:
+            if "inputSchema" in tool:
+                ToolUtils.fix_json_schema(tool["inputSchema"])
+
         # # 保存json文件
         # with open('tools_list.json', 'w', encoding='utf-8') as f:
         #     json.dump(tools_list, f, ensure_ascii=False, indent=4)
@@ -339,13 +346,14 @@ class ToolFactory:
 # 构建Prompt -> LLM推理 -> 处理回复(槽位/工具) -> Reflection。
 
 
-# dataclass 自动帮你生成 __init__(self, name, llm, tools,...)
 @dataclass
 class SwarmAgent:
     name: str
-    llm: Any # OpenAIChatGenerator
+    llm: Any  # OpenAIChatGenerator
     tools: List[Any]  # List[Tool]
-    system_prompt_template: str
+    system_prompt_template: str  # Jinja2 模板字符串
+
+    # dataclass 自动生成 __init__(self, name, llm, tools,...)
 
     def __post_init__(self):    # 做一些额外的初始化
         for i, tool in enumerate(self.tools):
@@ -353,141 +361,148 @@ class SwarmAgent:
                 self.tools[i] = create_tool_from_function(tool)
             elif isinstance(tool, dict):   # tool
                 self.tools[i] = ToolFactory.create_api_tool(tool)
-            else: # 假设已经是 Tool 类型
+            elif isinstance(tool, Tool):
                 pass
+            else:
+                print("！！！！！！！", tool)
         
         # 创建工具调用器
         self.tool_invoker = ToolInvoker(tools=self.tools, raise_on_failure=False) if self.tools else None
         # 自修正最大尝试次数
-        self.max_reflection_steps = 3
+        self.max_reflection_steps = 2
+    
+    def _render_system_msg(self, context: GlobalContext):
+        """
+        [Helper] 负责根据当前 Context 动态渲染 System Prompt
+        """
+        template = Template(self.system_prompt_template)
+        sys_content = template.render(
+            task=AGENT_TASK_DESC[self.name], 
+            cur_time=get_current_time_str(),
+            user_profile=context.user_profile.model_dump(), # 注入用户信息
+            slots=context.slots  # 已知槽位
+        )
+        return ChatMessage.from_system(sys_content)
     
     def _build_messages(self, context: GlobalContext) -> List[ChatMessage]:
-        """构建发送给 LLM 的消息列表 (System + History)"""
-        # 1. System Message (所有 Agent 都需要)
-        sys_content = self.system_prompt_template
+        """动态构建消息"""
 
-        # 2. 动态注入上下文 (Worker 需要摘要和槽位，Triage 不需要)
-        if self.name != AgentName.TRIAGE:
-            # 过滤 System 消息，避免 token 浪费
-            history_summary = [m.text for m in context.chat_history if m.role != ChatRole.SYSTEM][-10:] 
-            sys_content += f"\n[上下文摘要]\n近期对话：{history_summary}"
-            sys_content += f"\n当前已收集信息(Slots)：{json.dumps(context.slots, ensure_ascii=False)}"
-        
-        messages = [ChatMessage.from_system(sys_content)]
+        # 1. 初始渲染 System Prompt
+        sys_prompt = self._render_system_msg(context)
 
+        # 2. 构建消息列表
+        messages = [sys_prompt]
+        valid_history = [m for m in context.chat_history if m.role != ChatRole.SYSTEM]
+
+        # Triage 看摘要 + 最近 3 轮原始对话
+        # Worker 看滑动窗口原始对话，但要注意话题切换时的截断。
         if self.name == AgentName.TRIAGE:
-            # 中控：需要全量历史来判断意图
-            valid_history = [m for m in context.chat_history if m.role != ChatRole.SYSTEM]
-            messages.extend(valid_history)
+            if context.conversation_summary:
+                # 可以在这里插入一个 Summary 消息
+                messages[-1] += f"\n对话摘要：\n{context.conversation_summary}"
+            messages.extend(valid_history[-3:]) 
+        else:
+            # Short-term Memory 保留所有细节参数（日期、数字），防止丢失关键信息
+            messages.extend(valid_history[-10:])
 
-        # messages.append(ChatMessage.from_user(current_user_input))
         return messages
     
-    def _extract_slots(self, text: str):
-        """尝试从思维链中提取 JSON 槽位
-        # 模式：匹配 ```json {...} ``` 或 直接的 {...}
-        """
-        json_str, clean_target = "", ""
-        try:
-            # 优先匹配 markdown json 块
-            match_block = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-            if match_block:
-                json_str = match_block.group(1)
-                clean_target = match_block.group(0) # 用于后续删除
-            else:
-                # 兜底：寻找最外层 {}
-                match_direct = re.search(r"\{.*\}", text, re.DOTALL)
-                if match_direct:
-                    json_str = match_direct.group(0)
-                    clean_target = json_str
-                    
-            return json_str, clean_target
-        except:
-            traceback.print_exc()
-            return "", ""
-
     def run(self, context: GlobalContext):
-        """
-        执行 ReAct 循环：
-            Reason -> Act -> Observe -> Reflect(若出错) -> Final Answer
-
+        """执行 ReAct 循环：
+        Reason -> Act -> Observe -> Reflect(若出错) -> Final Answer
         返回: {'response': str, 'next_agent': str | None, 'messages': List[ChatMessage]}
         """
         messages = self._build_messages(context)
-        # 记录初始长度，用于最后切片返回新增的消息
-        initial_msg_count = len(messages)
+        initial_msg_count = len(messages)   # 记录初始长度，用于最后切片返回新增的消息
 
-        # # 安全检查
-        # if not SafetyGuard.check(current_user_input):
-        #     return {"response": "⚠️ 根据公司合规要求，无法处理涉及薪资或高管隐私的查询。", "next_agent": None, "messages":[]}
-        
         print(f"\n[调试] {self.name} Agent, LLM Messages:")
         for m in messages:
-            msg = m.text.replace("\n", " ")[:100]
+            if m.text:
+                log_content = m.text
+            elif m.tool_calls:
+                # 如果是 Assistant 发起的工具调用 (Tool Calls)
+                tool_names = [tc.tool_name for tc in m.tool_calls]
+                log_content = f"👉 [Calling Tools]: {', '.join(tool_names)}"
+            elif m.tool_call_results:
+                # 如果是 Tool 返回的结果 (Tool Result) <-- 修复这里的报错
+                results = [str(tr.result) for tr in m.tool_call_results]
+                log_content = f"✅ [Tool Result]: {', '.join(results)}"
+
+            msg = str(log_content).replace("\n", " ")[:100]
             print(f"  - [{m.role.value}]: {msg}...") # 打印前100字
+
+        # 安全检查 SafetyGuard
         
-        # ReAct 循环
+        # ReAct Loop (最大尝试 3 次)
         for step in range(self.max_reflection_steps + 1):
             # 1. LLM 生成
             try:
+                # print("===", messages)
                 response = self.llm.run(messages=messages, tools=self.tools)
                 agent_msg = response["replies"][0]
                 messages.append(agent_msg)
             except Exception as e:
-                logger.error(f"LLM 调用失败: {e}")
+                logger.error(f"LLM 调用失败: {traceback.format_exc()}")
                 return {"response": "系统繁忙，请重试。", "next_agent": None, "new_messages": []}
 
-            logger.info(f"[调试 {self.name}] Output: {agent_msg.text[:50]}... ToolCalls: {len(agent_msg.tool_calls)}")
+            # logger.info(f"[调试 {self.name}] Output: {agent_msg.text[:50]}... ToolCalls: {len(agent_msg.tool_calls)}")
 
-            # 2. 统一提取并更新槽位信息 (无论后续是否调用工具)
-            json_str, clean_target = self._extract_slots(agent_msg.text)
+            # 2. 提取并更新槽位信息 (无论后续是否调用工具)
+            new_slots, json_str = safe_parse_json(agent_msg.text)
             if json_str:
-                try:
-                    # json_str = json_str.replace("'", '"')   # 容错：LLM 有时会错误使用单引号
-                    data = json.loads(json_str)
-                    if new_slots := data.get("slot_update"):
-                        print(f"  [Slot Update] {new_slots}")
-                        context.update_slots(new_slots)  # 实时更新全局状态
-                    
-                    # 清洗消息文本，移除 JSON 块，保留对用户的自然语言回复
-                    clean_text = agent_msg.text.replace(clean_target, "").strip()
-                    # 重新构建消息
-                    new_msg = ChatMessage.from_assistant(
-                        text=clean_text,
-                        tool_calls=agent_msg.tool_calls,  # 重要：保留工具调用信息！
-                        meta=agent_msg.meta               # 保留元数据
-                    )
-                    messages[-1] = new_msg        # 在列表中替换为新对象
-                    agent_msg = new_msg           # 更新当前引用
-                except Exception as e:
-                    traceback.print_exc()
+                new_slots = new_slots.get("slot_update")
+                print(f"  [Slot Update] {new_slots}")
+                # A. 更新全局状态
+                context.update_slots(new_slots)
+                # B. 【关键步骤】热更新 System Prompt (Hot Reload)
+                messages[0] = self._render_system_msg(context)
+                # # C. 模拟一条 Tool Output，明确告诉模型槽位已更新
+                # slot_feedback_msg = ChatMessage(
+                #     role=ChatRole.TOOL, # 伪装成工具返回
+                #     text=f"[System Notification] Memory updated. Current Slots: {json.dumps(context.slots, ensure_ascii=False)}",
+                #     tool_calls=[]
+                # )
+                # messages.append(slot_feedback_msg)
+
+                # 清洗消息文本，移除 JSON 块，保留对用户的自然语言回复
+                clean_text = agent_msg.text.replace(json_str, "").strip()
+                # 重新构建消息
+                new_msg = ChatMessage.from_assistant(
+                    text=clean_text,
+                    tool_calls=agent_msg.tool_calls,  # 重要：保留工具调用信息！
+                    meta=agent_msg.meta               # 保留元数据
+                )
+                messages[-1] = new_msg        # 在列表中替换为新对象
+                agent_msg = new_msg           # 更新当前引用
 
             # 3. 判断是否包含工具调用
             if not agent_msg.tool_calls:
+                # Case A: 纯文本回复 (无工具调用)，结束
                 logger.info("  →Case A: 直接回复 (无工具调用)")
-                # Case A: 纯文本回复 (无工具调用)
-                new_messages = messages[initial_msg_count:] 
-                return {"response": agent_msg.text, "next_agent": None, "new_messages":new_messages}
+                return {
+                    "response": agent_msg.text, 
+                    "next_agent": None, 
+                    "new_messages":messages[initial_msg_count:]
+                }
 
-            # Case B: 处理工具调用 (ReAct)
+            # Case B: 处理工具调用
             tool_results = []
-            next_agent_candidate = None
-
             for tc in agent_msg.tool_calls:
-                # B-1 拦截转接指令
+                # B-1 拦截转接指令 (Handoff)
                 if tc.tool_name.startswith("transfer_to_"):
                     next_agent_candidate = tc.tool_name.replace("transfer_to_", "")
                     logger.info(f"  →Case B-1: 拦截转接指令 {next_agent_candidate}")
 
-                    # 构造一条系统通知消息（可选，用于历史记录）
-                    handoff_msg = ChatMessage.from_system(f"正在为您转接至 {next_agent_candidate}...")
+                    # 构造转接消息存入历史
+                    # 必须为 TOOL 类型的 Msg，才能保证Function Calling 闭环 [Assistant(Call), Tool(Result)]
+                    handoff_msg = ChatMessage.from_tool(f"正在为您转接至 {next_agent_candidate}...", origin=tc)    # tool_calls=[]
                     messages.append(handoff_msg)
 
-                    new_messages = messages[initial_msg_count:] 
+                    # 转接时，不需要执行实际工具，直接返回控制权
                     return {
                         "response": f"正在为您转接至 {next_agent_candidate}...", 
                         "next_agent": next_agent_candidate, 
-                        "new_messages": new_messages    # 返回包含转接指令的历史
+                        "new_messages": messages[initial_msg_count:]
                     }
                 
                 # B-2 执行业务工具
@@ -503,16 +518,19 @@ class SwarmAgent:
                     error_msg = ChatMessage.from_tool(f"Tool execution failed: {str(e)}. Please correct arguments and retry.", origin=tc)
                     tool_results.append(error_msg)
 
-            # 将工具结果追加到历史，进入下一次 LLM 生成
             if tool_results:
                 messages.extend(tool_results)
+                # 循环继续，LLM 看到 Tool Result 后会进行下一步生成
             else:
                 # 如果有 tool_calls 但没产生 tool_results (极端情况)，避免死循环
                 if step == self.max_reflection_steps:
                     return {"response": "系统暂时无法处理该请求，请稍后重试或联系人工。", "next_agent": None, "new_messages":[]}
 
-        new_messages = messages[initial_msg_count:] 
-        return {"response": messages[-1].text, "next_agent": None, "new_messages": new_messages}
+        return {
+            "response": messages[-1].text, 
+            "next_agent": None, 
+            "new_messages": messages[initial_msg_count:] 
+        }
 
 
 # --- 5. 编排系统 (Orchestrator System) ---
@@ -532,35 +550,49 @@ class SwarmSystem:
         self._init_agents()
 
     def _init_agents(self):
-        # 1. 加载工具，从指定 API 接口动态拉取可用的工具列表
-        tools_list = ToolFactory.fetch_tools_from_remote()
-        # schema类型转换，确保兼容性
-        for tool in tools_list:
-            if "inputSchema" in tool:
-                ToolUtils.fix_json_schema(tool["inputSchema"])
+        from prompt import triage_prompt, worker_prompt
 
-        # 2. 定义转接工具 (Triage 专用)
+        # 加载转接工具 (Triage 专用)
+        TRANS_TOOL_DESC = {
+            AgentName.LEAVE: "转接给 LeaveAgent，处理员工各类假期申请的工作，包括但不限于年假、病假、事假、丧假等",
+            AgentName.STATUS: "转接给 StatusQueryAgent，处理员工考勤状态查询的工作，包括但不限于考勤记录、假期余额、排班信息等",
+            AgentName.MANAGE: "转接给 LeaveManageAgent，处理各类假期管理的工作，包括但不限于撤销申请、提前结束假期等",
+            AgentName.POLICY: "转接给 PolicyQueryAgent，处理考勤与假期政策查询的工作，包括但不限于各类假期的计算规则、资格条件等",
+            AgentName.SUPPORT: "转接给 SystemSupportAgent，处理系统技术支持代理工作，包括但不限于申请提交报错、年假申请界面天数显示有误、页面异常等"
+        }
         transfer_tools = [
             Tool(
                 name=f"transfer_to_{name}",
                 description=desc,
                 parameters={"type": "object", "properties": {}, "required": []},    # inputSchema
                 function=lambda: f"Transferred to {name}"
-            ) for name, desc in AGENT_DESCRIPTIONS.items()
+            ) for name, desc in TRANS_TOOL_DESC.items()
         ]
 
-        # 2. 定义子代理专属工具
+        # 初始化 Triage Agent
+        self.agents[AgentName.TRIAGE] = SwarmAgent(
+            name=AgentName.TRIAGE,
+            llm=self.llm,
+            tools=transfer_tools, # + human_escalate
+            system_prompt_template=triage_prompt
+        )
+
+        # 加载worker工具
+        # 从指定 API 接口动态拉取可用的工具列表
+        worker_tools = ToolFactory.fetch_tools_from_remote()
+        WORKER_TOOL_DICT = {}
         # 假期申请代理-工具集
-        leave_tools = [x for x in tools_list if x['name'] in leave_map]
+        WORKER_TOOL_DICT[AgentName.LEAVE] = [x for x in worker_tools if x['name'] in leave_map]
         # 假期管理代理-工具集
-        leave_manage_tools = [x for x in tools_list if x['name'] in leave_manage_map]
+        WORKER_TOOL_DICT[AgentName.MANAGE] = [x for x in worker_tools if x['name'] in leave_manage_map]
         # 状态查询代理-工具集
-        status_query_tools = [x for x in tools_list if x['name'] in status_query_map]
+        WORKER_TOOL_DICT[AgentName.STATUS] = [x for x in worker_tools if x['name'] in status_query_map]
         # 政策查询代理-工具集
-        policy_query_tools = [x for x in tools_list if x['name'] in policy_query_map]
+        WORKER_TOOL_DICT[AgentName.POLICY] = [x for x in worker_tools if x['name'] in policy_query_map]
         # 系统支持代理-工具集
-        system_support_tools = [x for x in tools_list if x['name'] in system_support_map]
-        # 跳转工具
+        WORKER_TOOL_DICT[AgentName.SUPPORT] = [x for x in worker_tools if x['name'] in system_support_map]
+        
+        # 额外定义一个跳转工具
         transfer_back_to_triage = {
             "name": "transfer_to_TriageAgent", 
             "description": "当前任务执行完成，或者需要转接至其他代理继续执行任务，调用此工具",
@@ -568,78 +600,25 @@ class SwarmSystem:
             "scope_description": "0,1101"
         }
 
-        # 3. 初始化 Agents
-        from prompt import triage_prompt, worker_prompt
-
-        # 中控 Agent (Orchestrator / Triage)
-        self.agents[AgentName.TRIAGE] = SwarmAgent(
-            name=AgentName.TRIAGE,
-            llm=self.llm,
-            tools=transfer_tools, # + human_escalate
-            system_prompt_template=triage_prompt
-        )
-        
-        # 专业子 Agent
-
-        # 假期申请代理
-        self.agents[AgentName.LEAVE] = SwarmAgent(
-            name=AgentName.LEAVE,    # LeaveAgent
-            llm=self.llm,
-            tools=leave_tools + [transfer_back_to_triage],
-            system_prompt_template=Template(worker_prompt).render(
-                task="处理员工各类假期申请的工作，包括但不限于年假、病假、事假、丧假等",
-                cur_time=str(cur_time),
-                employee_info=str(employee_info)
-            ),
-        )
-        # 状态查询代理
-        self.agents[AgentName.STATUS] = SwarmAgent(
-            name=AgentName.STATUS,    # StatusQueryAgent
-            llm=self.llm,
-            tools=status_query_tools + [transfer_back_to_triage],
-            system_prompt_template=Template(worker_prompt).render(
-                task="处理员工考勤状态查询的工作，包括但不限于考勤记录、假期余额、排班信息等",
-                cur_time=str(cur_time),
-                employee_info=str(employee_info)
-            ),
-        )
-        # 假期管理代理
-        self.agents[AgentName.MANAGE] = SwarmAgent(
-            name=AgentName.MANAGE,    # LeaveManageAgent
-            llm=self.llm,
-            tools=leave_manage_tools + [transfer_back_to_triage],
-            system_prompt_template=Template(worker_prompt).render(
-                task="处理各类假期管理的工作，包括但不限于撤销申请、提前结束假期等",
-                cur_time=str(cur_time),
-                employee_info=str(employee_info)
-            ),
-        )
-        # 政策查询代理
-        self.agents[AgentName.POLICY] = SwarmAgent(
-            name=AgentName.POLICY,    # PolicyQueryAgent
-            llm=self.llm,
-            tools=policy_query_tools + [transfer_back_to_triage] + [retrieve_knowledge_with_rag],
-            system_prompt_template=Template(worker_prompt).render(
-                task="处理政策查询的工作，包括但不限于各类假期的计算规则、资格条件等",
-                cur_time=str(cur_time),
-                employee_info=str(employee_info)
-            ),
-        )
-        # 系统技术支持代理
-        self.agents[AgentName.SUPPORT] = SwarmAgent(
-            name=AgentName.SUPPORT,    # SystemSupportAgent
-            llm=self.llm,
-            tools=system_support_tools + [transfer_back_to_triage],
-            system_prompt_template=Template(worker_prompt).render(
-                task="处理系统技术支持代理工作，包括但不限于申请提交报错、年假申请界面天数显示有误、页面异常等",
-                cur_time=str(cur_time),
-                employee_info=str(employee_info)
-            ),
-        )
+        # 初始化 Worker Agents
+        for name, tools in WORKER_TOOL_DICT.items():
+            self.agents[name] = SwarmAgent(
+                name=name,
+                llm=self.llm,
+                tools=tools + [transfer_back_to_triage],
+                system_prompt_template=worker_prompt, 
+            )
+            # fix：PolicyQueryAgent
+            self.agents[AgentName.POLICY] = SwarmAgent(
+                name=AgentName.POLICY,
+                llm=self.llm,
+                tools=WORKER_TOOL_DICT[AgentName.POLICY] + [transfer_back_to_triage] + [retrieve_knowledge_with_rag],
+                system_prompt_template=worker_prompt,
+            )
     
     def run_turn(self, user_input: str, context: GlobalContext) -> str:
         """
-        运行一轮对话：支持在单次用户输入中进行多次 Agent 跳转
+        入口函数：处理单次用户请求
 
         1、Agent 激活：根据 next_agent 调度对应 Agent。
         2、执行agent.run()开始 ReAct Loop，追加新产生的 User/Assistant 消息到全局历史。
@@ -655,9 +634,10 @@ class SwarmSystem:
 
         # 2. 如果是新会话，默认从 Triage 开始；如果是多轮对话，可能维持在上一个 Agent
         # 这里可以加入逻辑：如果用户说“退出”、“返回主菜单”，强行重置为 Triage
-        if "返回" in user_input or "退出" in user_input:
+        if any(x in user_input for x in ["退出", "返回", "取消"]):
             context.next_agent = AgentName.TRIAGE
-            context.slots = {} # 清空槽位
+            # 策略：返回主菜单时是否清空槽位？视业务而定，通常建议清空
+            context.slots = {}
         
         max_handoffs = 3 # 防止无限转接死循环
         handoff_count = 0
@@ -674,34 +654,31 @@ class SwarmSystem:
             
             logger.info(f"--- Activating Agent: {agent.name} ---")
 
-            # 执行 Agent 逻辑
+            # 执行 Agent
             result = agent.run(context)
 
             # # 打印当前槽位状态，方便调试
             # print(f"\n[Global State] Agent: {current_agent_name} | Slots: {context.slots}")
 
-            # 更新全局历史 (追加 Agent 产生的思考过程、工具结果、回复)
+            # 更新历史 (追加 Agent 产生的思考过程、工具结果、回复)
             if result["new_messages"]:
                 context.chat_history.extend(result["new_messages"])
             
             final_response = result["response"]
             next_agent = result["next_agent"]
 
-            # 核心逻辑：判断是否结束
+            # 判断是否发生转接
             if next_agent and next_agent != current_agent_name:
                 # 发生了转接 -> 更新状态，进入下一次循环
-                print(f"\n🔄 Control passed: {context.next_agent} -> {next_agent} ---")
+                print(f"\n🔄 Handoff: {context.next_agent} -> {next_agent} 🔄")
                 context.next_agent = next_agent
                 handoff_count += 1
                 
-                # # 可选：如果转回 Triage，通常意味着任务结束或取消，是否需要清空槽位？
-                # if next_agent == AgentName.TRIAGE:
-                #     # context.slots = {} # 根据业务需求决定是否保留
-                #     pass
-                
-                # 重要：不要在这里 return，continue 让下一个 agent 立即执行
-                # 这样用户感觉是无缝的
-                continue 
+                # === 关键生命周期管理 ===
+                # 如果从 Triage 转出，通常意味着新任务开始
+                # 如果从 Worker 转回 Triage，意味着任务结束
+                # 这里可以插入逻辑来更新 Summary，或截断 History
+                continue # 立即进入下一个 Agent 的处理流程
             else:
                 # 没有转接，或者是转接给自己（通常意味着等待用户输入），结束本轮
                 break
@@ -823,5 +800,14 @@ if __name__ == "__main__":
     # 预期: {'leave_type': '年假', 'start_date': '2026-01-21', 'duration': '全天', 'qjly': '累了想休息'}
     print("-" * 30)
 
+    # ------------------------------------------------------------------
 
+    while True:
+        # 获取用户输入
+        user_input = input("\nUser: ")
+        response = swarm_system.run_turn(user_input, context)
 
+        print(f"User: {user_input}")
+        print(f"Bot : {response}")
+        print(f"[State] Slots Updated: {context.slots}")
+        print("-" * 30)
