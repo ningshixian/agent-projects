@@ -1,4 +1,5 @@
-# Building a agentic RAG with Function Calling
+# Reference
+# https://haystack.deepset.ai/blog/swarm-of-agents
 # https://colab.research.google.com/github/deepset-ai/haystack-tutorials/blob/main/tutorials/40_Building_Chat_Application_with_Function_Calling.ipynb#scrollTo=ZE0SEGY92GHJ
 import os
 import sys
@@ -23,12 +24,15 @@ from utils import safe_parse_json, get_current_time_str
 
 # Haystack 核心组件
 from haystack import Document, Pipeline
+from haystack.components.agents import Agent, State
 from haystack.components.generators.chat import HuggingFaceLocalChatGenerator, OpenAIChatGenerator
-from haystack.dataclasses import ChatMessage, ChatRole, ToolCall
-from haystack.components.generators.utils import print_streaming_chunk
-from haystack.tools import create_tool_from_function    #
-from haystack.tools import Tool
 from haystack.components.tools import ToolInvoker
+from haystack.components.tools.tool_invoker import ToolNotFoundException, StringConversionError
+from haystack.components.routers import ConditionalRouter
+from haystack.dataclasses import ChatMessage, ChatRole, ToolCall
+from haystack.tools import Tool, Toolset, create_tool_from_function
+from haystack.components.generators.utils import print_streaming_chunk
+
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -105,6 +109,7 @@ leave_map = {
     "考勤-请计划生育假": "attendance_apply_for_family_planning_leave",
     "考勤-请哺乳假": "attendance_apply_for_nursing_leave",
     "考勤-请跨国工作探亲假": "attendance_apply_for_overseas_family_visit_leave",
+    "考勤-请返乡假": "attendance_apply_for_fanxiang_leav", 
 }
 leave_manage_map = {
     "考勤-撤销请假": "attendance_cancel_leave_request",
@@ -119,6 +124,7 @@ status_query_map = {
     # "考勤-查询员工信息": "attendance_get_employee_info",
     "考勤-查询员工考勤日报": "attendance_get_employee_daily_report",
     "考勤-查询员工排班": "attendance_get_employee_schedule",
+    "考勤-查询返乡假": "attendance_get_fanxiang_leave", 
 }
 policy_query_map = {
     "考勤-查询离职年假计算规则": "attendance_get_resignation_annual_leave_rules",
@@ -367,7 +373,12 @@ class SwarmAgent:
                 print("！！！！！！！", tool)
         
         # 创建工具调用器
-        self.tool_invoker = ToolInvoker(tools=self.tools, raise_on_failure=False) if self.tools else None
+        self.tool_invoker = ToolInvoker(
+            tools=self.tools, 
+            raise_on_failure=False,
+            max_workers=4,
+            # convert_result_to_json_string=True
+        )
         # 自修正最大尝试次数
         self.max_reflection_steps = 2
     
@@ -508,15 +519,21 @@ class SwarmAgent:
                 # B-2 执行业务工具
                 try:
                     logger.info(f"  →Case B-2: 执行业务工具 Invoking {tc.tool_name}...")
-                    res = self.tool_invoker.run(messages=[agent_msg])
+                    res = self.tool_invoker.run(messages=[agent_msg], state=None)
                     tool_msg = res["tool_messages"][0]
+                except ToolNotFoundException as e:
+                    logger.error(f"工具调用失败: {e}")
+                    tool_msg = ChatMessage.from_tool(f"工具未找到，调用失败. Please correct arguments and retry.", origin=tc)
+                except StringConversionError as e:
+                    logger.error(f"结果转换失败: {e}")
+                    tool_msg = ChatMessage.from_tool(f"结果转换错误，工具调用失败. Please correct arguments and retry.", origin=tc)
+                except Exception as e:
+                    logger.error(f"tool_invoker.run() 执行失败: {e}")
+                    tool_msg = ChatMessage.from_tool(f"Tool execution failed: {str(e)}. Please correct arguments and retry.", origin=tc)
+                finally:
+                    # Reflection: 将错误写回消息列表，让模型自修正
                     tool_results.append(tool_msg)
                     # context.last_tool_output = tool_msg.text
-                except Exception as e:
-                    # Reflection: 将错误写回消息列表，让模型自修正
-                    print(f"  [Reflection] Tool Error: {e}. Requesting fix...")
-                    error_msg = ChatMessage.from_tool(f"Tool execution failed: {str(e)}. Please correct arguments and retry.", origin=tc)
-                    tool_results.append(error_msg)
 
             if tool_results:
                 messages.extend(tool_results)
@@ -545,6 +562,7 @@ class SwarmSystem:
             generation_kwargs={"temperature": 0.5},
             timeout=60, 
             max_retries=2,
+            streaming_callback=print_streaming_chunk
         )
         self.agents = {}      # Agent 注册表
         self._init_agents()
@@ -552,7 +570,7 @@ class SwarmSystem:
     def _init_agents(self):
         from prompt import triage_prompt, worker_prompt
 
-        # 加载转接工具 (Triage 专用)
+        # 定义转接工具 (Triage 专用)
         TRANS_TOOL_DESC = {
             AgentName.LEAVE: "转接给 LeaveAgent，处理员工各类假期申请的工作，包括但不限于年假、病假、事假、丧假等",
             AgentName.STATUS: "转接给 StatusQueryAgent，处理员工考勤状态查询的工作，包括但不限于考勤记录、假期余额、排班信息等",
